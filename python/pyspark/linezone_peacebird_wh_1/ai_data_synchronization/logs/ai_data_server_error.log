@@ -1,0 +1,2 @@
+太平鸟产品 - 2018-11-06 22:25:43,380 - ERROR - ai_data_synchronization.py - cal_exe - 162 - ('9999', '系统繁忙，请稍后再试<list index out of range>')
+太平鸟产品 - 2018-11-06 22:27:17,638 - ERROR - ai_data_synchronization.py - cal_exe - 162 - ('9999', "系统繁忙，请稍后再试<name 'D' is not defined>")

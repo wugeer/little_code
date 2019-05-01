@@ -1,0 +1,188 @@
+# -*- coding: utf-8 -*-
+"""
+-------------------------------------------------
+   File Name：     p_mid_day_end_stock
+   Description :
+   Author :       yangming
+   date：          2018/8/5
+-------------------------------------------------
+   Change Activity:
+                   2018/8/5:
+-------------------------------------------------
+--
+-- 项目: peacebird
+-- 过程名: p_mid_day_end_stock
+-- 源表:  edw.fct_month_end_stock
+--        edw.fct_io
+--        edw.dim_store
+-- 目标表: edw.mid_day_end_stock
+-- 程序描述: 日末库存表
+-- 程序路径: /opt/peacebird/edw/p_mid_day_end_stock.sql
+-- 程序备注:  
+-- 版本号信息: v1.0 create
+--             v1.1 修改为关联门店仓库表
+--             v2.0 alter   改写pyspark
+"""
+
+from os.path import abspath
+from pyspark.sql import SparkSession
+from dateutil.parser import parse
+
+import os
+import sys
+import datetime
+import time
+from datetime import timedelta
+
+
+class MidDayEndStock:
+    def __init__(self, p_input_date, is_online=True):
+        self.v_p_input_date = parse(p_input_date)
+        self.is_online = is_online
+
+        # 初始化spark环境
+        warehouse_location = abspath('hdfs://master1:9000/user/hive/warehouse')
+        # app_name
+        file_name = os.path.basename(__file__)
+        app_name = "".join(["PySpark-", file_name])
+
+        self.spark = SparkSession \
+            .builder \
+            .appName(app_name) \
+            .config("spark.sql.warehouse.dir", warehouse_location) \
+            .enableHiveSupport() \
+            .getOrCreate()
+
+    @staticmethod
+    def online_env_query(v_p_input_date):
+        if v_p_input_date.month == 1:
+            month_int = 12
+            year_int = v_p_input_date.year - 1
+            last_month_start = datetime.date(year_int, month_int, 1)
+        else:
+            last_month_start = datetime.date(v_p_input_date.year, v_p_input_date.month - 1, 1)
+        last_two_month_end = last_month_start - timedelta(days=1)
+
+        v_stock_begin_day = last_two_month_end.strftime("%Y-%m-%d")
+        return v_stock_begin_day
+
+    def cal_sql_params(self):
+        if self.is_online:
+            v_stock_begin_day = self.online_env_query(self.v_p_input_date)
+        else:
+            pass
+        res_dic = {"p_input_date": repr(self.v_p_input_date.strftime("%Y-%m-%d")),
+                   "v_stock_begin_day": repr(v_stock_begin_day)}
+        return res_dic
+
+    @staticmethod
+    def execute_spark_sql(spark_session, **kwargs):
+        # --  1.首先计算月结库存, 并且计算净入库
+        sql_tmp_mid_day_stock = """
+                            select {p_input_date} as stock_date
+                                , fmes.org_id
+                                , ds.store_type as org_type
+                                , fmes.product_id
+                                , fmes.color_id
+                                , fmes.size_id
+                                , fmes.stock_qty
+                                , 0 as receive_qty
+                                , 0 as send_qty
+                            from edw.fct_month_end_stock fmes
+                            inner join edw.dim_store ds on fmes.org_id=ds.store_id
+                            where fmes.stock_date = {v_stock_begin_day}
+                            union all 
+                            select {p_input_date} as stock_date
+                            , fi.org_id
+                            , max(ds.store_type) as org_type
+                            , fi.product_id
+                            , fi.color_id
+                            , fi.size_id
+                            , sum(fi.qty) as stock_qty
+                        --    , sum(case when fi.io_date={p_input_date} and fi.qty>0
+                        --            then fi.qty else 0 end) as receive_qty 
+                        --    , -sum(case when fi.io_date={p_input_date} and fi.qty<0
+                        --               then fi.qty else 0 end) as send_qty
+                            , 0 as receive_qty
+                            , 0 as send_qty
+                        from edw.fct_io fi 
+                        inner join edw.dim_store ds on fi.org_id=ds.store_id
+                        where fi.io_date > {v_stock_begin_day} and fi.io_date <= {p_input_date}
+                        group by fi.org_id, fi.product_id, fi.color_id, fi.size_id
+        """.format(**kwargs)
+
+        # 创建临时表
+        tmp_mid_day_stock = spark_session.sql(sql_tmp_mid_day_stock).createOrReplaceTempView("tmp_mid_day_stock")
+
+        # --  3.计算每天的库存
+        sql_1 = """
+                    insert overwrite table edw.mid_day_end_stock
+                    select
+                        stock_date
+                        , org_id
+                        , max(org_type) as org_type
+                        , product_id
+                        , color_id
+                        , size_id
+                        , sum(stock_qty) as stock_qty
+                        , sum(receive_qty) as receive_qty
+                        , sum(send_qty) as send_qty
+                        , current_timestamp as etl_time
+                    from tmp_mid_day_stock
+                    group by stock_date, org_id, product_id, color_id, size_id
+                    union all
+                    select * from edw.mid_day_end_stock where stock_date <> {p_input_date}
+        """.format(**kwargs)
+
+        # 执行SparkSQL
+        spark_session.sql(sql_1)
+
+        # drop 临时表
+        spark_session.catalog.dropTempView("tmp_mid_day_stock")
+
+    def __enter__(self):
+        self.start_time = time.time()
+        print('********************************      program start - {0}    *******************************************'
+              .format(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.start_time)))
+              )
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.end_time = time.time()
+        self.time_use = self.end_time - self.start_time
+        print('********************************   program end -{0} all-{1}  *******************************************'
+              .format(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.end_time)), self.time_use)
+              )
+        return self
+        
+
+if __name__ == '__main__':
+    argv_length = len(sys.argv)
+    day_1 = timedelta(days=1)
+    if argv_length == 1:
+        # spark2-submit p_mid_day_end_stock.py                               # 运行昨天的日末库存
+        p_begin_date = (datetime.date.today() - day_1).strftime('%Y-%m-%d')
+        with MidDayEndStock(p_begin_date) as mid_processer:
+            sql_params = mid_processer.cal_sql_params()
+            print(sql_params)
+            mid_processer.execute_spark_sql(mid_processer.spark, **sql_params)
+    elif argv_length == 2:
+        # spark2-submit p_mid_day_end_stock.py 2018-06-10
+        p_begin_date = parse(sys.argv[1]).strftime("%Y-%m-%d")
+        with MidDayEndStock(p_begin_date) as mid_processer:
+            sql_params = mid_processer.cal_sql_params()
+            mid_processer.execute_spark_sql(mid_processer.spark, **sql_params)
+    elif argv_length == 3:
+        # spark2-submit p_mid_day_end_stock.py 2018-06-01 2018-06-10
+        p_begin_date, p_end_date = parse(sys.argv[1]), parse(sys.argv[2])
+        v_input_date = p_begin_date
+        while v_input_date <= p_end_date:
+            with MidDayEndStock(v_input_date.strftime("%Y-%m-%d")) as mid_processer:
+                sql_params = mid_processer.cal_sql_params()
+                mid_processer.execute_spark_sql(mid_processer.spark, **sql_params)
+                v_input_date += day_1
+    else:
+        print('params error!!!')
+
+
+
